@@ -10,7 +10,44 @@ import sys
 import keyboard
 import pyperclip
 import threading
+import requests
+import time
+import logging
+from datetime import datetime
+import csv
 from ocr import ocr_and_search_prices
+
+def setup_logging():
+    """设置日志记录"""
+    # 创建日志记录器
+    logger = logging.getLogger('WFOCR')
+    logger.setLevel(logging.DEBUG)
+    
+    # 如果已经有处理器，就不要重复添加
+    if logger.handlers:
+        return logger
+    
+    # 创建文件处理器
+    file_handler = logging.FileHandler('log.txt', mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 创建控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # 创建格式化器
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # 添加处理器到记录器
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# 初始化日志记录器
+logger = setup_logging()
 
 def get_resource_path(relative_path):
     """获取资源文件的绝对路径，兼容开发环境和打包后的环境"""
@@ -25,41 +62,69 @@ def get_resource_path(relative_path):
 
 class WFOCRApp:
     def __init__(self):
+        logger.info("=== 程序启动 ===")
+        logger.info("初始化WFOCR应用程序")
+        
         self.root = tk.Tk()
-        self.root.title('科学天诺 测试版')
-        self.root.geometry('800x500')
+        self.root.title('科学天诺 测试版 2.4')
+        self.root.geometry('1000x500')
         self.root.resizable(True, True)
         
         # 配置文件路径
         self.config_file = 'wfocr_config.json'
+        logger.info(f"配置文件路径: {self.config_file}")
         self.config = self.load_config()
         
         # 状态变量
         self.script_running = False
         self.result_window = None
+        self.result_canvas = None
+        self.result_container = None
+        self.result_scrollbar = None
+        self.result_font = ('Consolas', self.config.get('font_size', 12))
+        self.result_button_style_name = 'Result.TButton'
+        self.result_status_label = None
+        self.result_minimize_after_id = None
+        self.status_var = tk.StringVar(value="")
+        self.can_save_click = False  # 控制是否允许保存点击
+        self.status_delay_timer = None  # 状态延迟显示定时器
+        self.countdown_remaining = 0  # 剩余倒计时时间
         self.crop_coords = None
         self.current_screenshot = None
         self.last_screenshot_time = 0  # 记录上次截图时间
+        self.price_update_timer = None  # 价格更新定时器
+        self.price_file_lock = threading.Lock()  # 价格文件读写锁
         
         # 图像引用保存
         self.ideal_image_ref = None
         self.current_image_ref = None
         self.canvas_image_ref = None
         
+        logger.info("设置用户界面")
         self.setup_ui()
+        logger.info("加载理想截图")
         self.load_ideal_image()
         
         # 预热OCR，在后台初始化以减少首次使用延迟
+        logger.info("开始预热OCR模型")
         self.preload_ocr()
+
+        # 加载CSV原始中文名映射
+        self.cn_name_map = self.load_cn_name_map()
+        
+        logger.info("程序初始化完成")
         
     def load_config(self):
         """加载配置文件"""
+        logger.info("开始加载配置文件")
         default_config = {
             'resolution_width': '',
             'resolution_height': '',
             'crop_coords': None,
             'copy_to_clipboard': False,
-            'font_size': 12
+            'font_size': 12,
+            'server_type': 'guangzhou',  # 默认选择广州服务器
+            'color_mode': 'golden'  # 默认识别金黄色
         }
         
         if os.path.exists(self.config_file):
@@ -70,17 +135,23 @@ class WFOCRApp:
                     for key in default_config:
                         if key not in config:
                             config[key] = default_config[key]
+                    logger.info(f"成功加载配置文件: {config}")
                     return config
-            except:
+            except Exception as e:
+                logger.error(f"加载配置文件失败: {e}")
                 return default_config
-        return default_config
+        else:
+            logger.info("配置文件不存在，使用默认配置")
+            return default_config
     
     def save_config(self):
         """保存配置文件"""
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
+            logger.info(f"配置文件保存成功: {self.config}")
         except Exception as e:
+            logger.error(f"保存配置失败: {e}")
             messagebox.showerror("错误", f"保存配置失败: {e}")
     
     def setup_ui(self):
@@ -104,6 +175,23 @@ class WFOCRApp:
         # 选择识别位置按钮
         ttk.Button(resolution_frame, text="选择识别位置", 
                   command=self.select_crop_area).grid(row=0, column=4, padx=10)
+        
+        # 服务器选择
+        ttk.Label(resolution_frame, text="数据源:").grid(row=0, column=5, padx=(20, 5))
+        
+        self.server_var = tk.StringVar(value=self.config['server_type'])
+        
+        # 广州服务器选项
+        guangzhou_radio = ttk.Radiobutton(resolution_frame, text="广州服务器", 
+                                         variable=self.server_var, value='guangzhou',
+                                         command=self.on_server_change)
+        guangzhou_radio.grid(row=0, column=6, padx=5)
+        
+        # WM API选项
+        wm_radio = ttk.Radiobutton(resolution_frame, text="WM API", 
+                                  variable=self.server_var, value='wm_api',
+                                  command=self.on_server_change)
+        wm_radio.grid(row=0, column=7, padx=5)
         
         # 控制按钮框架
         control_frame = ttk.Frame(self.root)
@@ -129,6 +217,22 @@ class WFOCRApp:
         font_combo.pack(side='left', padx=5)
         font_combo.bind('<<ComboboxSelected>>', self.on_font_size_change)
         
+        # 识别颜色选择
+        ttk.Label(control_frame, text="识别颜色:").pack(side='left', padx=(20, 5))
+        self.color_mode_var = tk.StringVar(value=self.config.get('color_mode', 'golden'))
+        
+        # 金黄色选项
+        golden_radio = ttk.Radiobutton(control_frame, text="金黄色", 
+                                      variable=self.color_mode_var, value='golden',
+                                      command=self.on_color_mode_change)
+        golden_radio.pack(side='left', padx=5)
+        
+        # 全部颜色选项
+        all_colors_radio = ttk.Radiobutton(control_frame, text="全部颜色", 
+                                          variable=self.color_mode_var, value='all_colors',
+                                          command=self.on_color_mode_change)
+        all_colors_radio.pack(side='left', padx=5)
+        
         # 理想截图显示
         ideal_frame = ttk.LabelFrame(self.root, text="理想中的截图", padding=10)
         ideal_frame.pack(fill='both', expand=True, padx=10, pady=5)
@@ -147,9 +251,13 @@ class WFOCRApp:
         info_label = ttk.Label(self.root, text="由 Green00101 开发，通过识别图像实现，不包含任何对游戏数据的操作，本软件开源免费。", 
                               foreground='gray')
         info_label.pack(pady=1)
-        info_label_2 = ttk.Label(self.root, text="为了有更好的识别效果，请将错误与意见发到 kexuetiannuo@163.com", 
+        info_label_2 = ttk.Label(self.root, text="本软件为玩家自制与官方无关，有问题的话，请将错误与意见发到 kexuetiannuo@163.com", 
                               foreground='gray')
         info_label_2.pack(pady=1)
+        
+        # 价格数据状态指示器
+        self.price_status_label = ttk.Label(self.root, text="", foreground='blue')
+        self.price_status_label.pack(pady=2)
         
         # 绑定关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -168,23 +276,30 @@ class WFOCRApp:
     
     def select_crop_area(self):
         """选择识别区域"""
+        logger.info("开始选择识别区域")
         # 检查分辨率是否填写
         if not self.width_var.get() or not self.height_var.get():
+            logger.warning("分辨率未填写，停止选择识别区域")
             messagebox.showwarning("警告", "请先填写分辨率")
             return
         
         try:
             width = int(self.width_var.get())
             height = int(self.height_var.get())
-        except ValueError:
+            logger.info(f"使用分辨率: {width}x{height}")
+        except ValueError as e:
+            logger.error(f"分辨率格式错误: {e}")
             messagebox.showerror("错误", "分辨率必须是数字")
             return
         
         # 截图
         try:
+            logger.info(f"开始截图，区域: (0, 0, {width}, {height})")
             screenshot = pyautogui.screenshot(region=(0, 0, width, height))
+            logger.info("截图成功，显示裁剪对话框")
             self.show_crop_dialog(screenshot)
         except Exception as e:
+            logger.error(f"截图失败: {e}")
             messagebox.showerror("错误", f"截图失败: {e}")
     
     def show_crop_dialog(self, image):
@@ -278,44 +393,111 @@ class WFOCRApp:
     
     def start_script(self):
         """启动脚本"""
+        logger.info("=== 启动脚本 ===")
+        logger.info(f"当前配置: {self.config}")
+        
         if not self.config['crop_coords']:
+            logger.warning("未设置识别区域，停止启动脚本")
             messagebox.showwarning("警告", "请先选择识别区域")
             return
         
         if self.script_running:
+            logger.warning("脚本已在运行中")
             messagebox.showinfo("提示", "脚本已在运行中")
             return
+        
+        logger.info(f"选择的数据源: {self.config['server_type']}")
+        
+        # 如果选择了广州服务器，检查和更新price.json文件
+        if self.config['server_type'] == 'guangzhou':
+            logger.info("广州服务器模式，检查price.json文件")
+            if not self.check_and_update_price_json():
+                logger.error("无法获取价格文件，停止启动脚本")
+                return  # 如果无法获取价格文件，停止启动
+            self.update_price_status("🌐 使用广州服务器数据源")
+            logger.info("广州服务器数据源配置完成")
+        else:
+            self.update_price_status("🔗 使用WM API数据源")
+            logger.info("WM API数据源配置完成")
         
         self.script_running = True
         self.start_button.configure(text="脚本运行中...", state='disabled')
         
         # 创建结果显示窗口
+        logger.info("创建结果显示窗口")
         self.create_result_window()
+        # 显示即将最小化提示并启动14秒最小化定时
+        self.show_minimize_countdown(seconds=14)
+        
+        # 如果是广州服务器模式，启动定时更新
+        if self.config['server_type'] == 'guangzhou':
+            logger.info("启动价格更新定时器")
+            self.start_price_update_timer()
         
         # 开始监听热键
+        logger.info("启动热键监听线程")
         threading.Thread(target=self.start_hotkey_listener, daemon=True).start()
+        
+        logger.info("脚本启动完成，等待F8按键")
     
     def create_result_window(self):
-        """创建结果显示窗口"""
+        """创建结果显示窗口（按钮 + 价格，可滚动）"""
         self.result_window = Toplevel(self.root)
         self.result_window.title("识别结果")
-        self.result_window.geometry("1050x200")
-        self.result_window.configure(bg='black')
-        
-        # 创建文本框
-        self.result_text = tk.Text(self.result_window, 
-                                  bg='black', 
-                                  fg='white', 
-                                  font=('Consolas', self.config['font_size']),
-                                  wrap='word',
-                                  padx=10,
-                                  pady=10)
-        
-        self.result_text.pack(fill='both', expand=True)
-        
+        self.result_window.geometry("980x270")
+        # 允许最大化/最小化
+        try:
+            self.result_window.resizable(True, True)
+        except Exception:
+            pass
+
+        # 置顶（避免被覆盖），不抢焦点
+        try:
+            self.result_window.wm_attributes('-topmost', True)
+        except Exception:
+            pass
+        # 取消工具窗口样式，恢复标准标题栏（含最小化/最大化/关闭）
+        try:
+            self.result_window.wm_attributes('-toolwindow', False)
+        except Exception:
+            pass
+        # 防止窗口激活时任务栏图标闪烁
+        self.result_window.focus_set = lambda: None
+        self.result_window.lift = self._safe_lift
+
+        # 底部状态栏（必须先创建，才能正确布局在底部）
+        bottom_bar = tk.Frame(self.result_window, bg='lightgray', height=30)
+        bottom_bar.pack(side='bottom', fill='x')
+        bottom_bar.pack_propagate(False)  # 防止高度被内容改变
+        self.result_status_label = tk.Label(bottom_bar, textvariable=self.status_var, font=self.result_font, anchor='w', fg='green', bg='lightgray')
+        self.result_status_label.pack(side='left', fill='x', expand=True, padx=10, pady=2)
+
+        # 容器框架（占据剩余空间）
+        outer = ttk.Frame(self.result_window)
+        outer.pack(fill='both', expand=True)
+
+        # 可滚动区域（Canvas + 内部Frame）
+        self.result_canvas = tk.Canvas(outer, highlightthickness=0)
+        self.result_scrollbar = ttk.Scrollbar(outer, orient='vertical', command=self.result_canvas.yview)
+        self.result_canvas.configure(yscrollcommand=self.result_scrollbar.set)
+
+        self.result_container = ttk.Frame(self.result_canvas)
+        self.result_container.bind(
+            "<Configure>",
+            lambda e: self.result_canvas.configure(scrollregion=self.result_canvas.bbox("all"))
+        )
+
+        self.result_canvas.create_window((0, 0), window=self.result_container, anchor='nw')
+        self.result_canvas.pack(side='left', fill='both', expand=True)
+        self.result_scrollbar.pack(side='right', fill='y')
+
+        # 初始化按钮样式
+        self.update_result_button_style()
+
         # 初始提示
-        self.result_text.insert('end', "脚本已开启，按F8开始识别")
-        
+        tip_label = ttk.Label(self.result_container, text="脚本已开启，按F8开始识别", font=self.result_font)
+        tip_label.pack(padx=12, pady=6, anchor='w')
+
         # 关闭事件
         self.result_window.protocol("WM_DELETE_WINDOW", self.stop_script)
     
@@ -325,13 +507,17 @@ class WFOCRApp:
     
     def on_f8_pressed(self):
         """F8按键响应"""
+        logger.info("--- F8按键被按下 ---")
+        
         if not self.script_running:
+            logger.warning("脚本未运行，忽略F8按键")
             return
         
         # 检查时间间隔
         import time
         current_time = time.time()
         if current_time - self.last_screenshot_time < 1.0:  # 1秒间隔
+            logger.info(f"按键间隔过短 ({current_time - self.last_screenshot_time:.2f}秒)，忽略此次按键")
             return
         self.last_screenshot_time = current_time
         
@@ -339,11 +525,14 @@ class WFOCRApp:
             # 截图
             width = int(self.config['resolution_width'])
             height = int(self.config['resolution_height'])
+            logger.info(f"开始F8截图，分辨率: {width}x{height}")
             screenshot = pyautogui.screenshot(region=(0, 0, width, height))
             
             # 裁剪
             coords = self.config['crop_coords']
+            logger.info(f"裁剪坐标: {coords}")
             cropped = screenshot.crop(coords)
+            logger.info(f"裁剪后图片尺寸: {cropped.size}")
             
             # 显示当前截图
             self.update_current_screenshot(cropped)
@@ -351,18 +540,38 @@ class WFOCRApp:
             # 转换为numpy数组
             img_array = np.array(cropped)
             img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            logger.info("图片转换为numpy数组完成")
             
             # OCR识别
-            results = ocr_and_search_prices(img_array)
+            logger.info(f"开始OCR识别，使用数据源: {self.config['server_type']}, 颜色模式: {self.config['color_mode']}")
+            results = ocr_and_search_prices(img_array, self.config['server_type'], self.price_file_lock, self.config['color_mode'])
+            logger.info(f"OCR识别完成，结果数量: {len(results) if results else 0}")
             
             # 显示结果
             self.display_results(results)
+            # 识别界面弹出并在14秒后最小化（避免任务栏闪烁）
+            try:
+                # 先隐藏，更新内容后再展示，可减少任务栏闪亮
+                self.result_window.withdraw()
+                # 立刻显示但不抢焦点
+                self.result_window.deiconify()
+                self._safe_lift()
+            except Exception:
+                pass
+            self.show_minimize_countdown(seconds=14)
+            
+            # 允许保存本次识别结果的第一次点击
+            self.can_save_click = True
             
         except Exception as e:
             error_msg = f"识别出错: {e}"
-            if self.result_window and self.result_text:
-                self.result_text.delete('1.0', 'end')
-                self.result_text.insert('end', error_msg)
+            logger.error(f"F8处理过程出错: {e}")
+            if self.result_window and self.result_container:
+                self._clear_result_container()
+                err_label = ttk.Label(self.result_container, text=error_msg, font=self.result_font)
+                err_label.pack(padx=12, pady=10, anchor='w')
+            else:
+                logger.error("结果窗口不存在，无法显示错误信息")
     
     def update_current_screenshot(self, image):
         """更新当前截图显示"""
@@ -375,35 +584,229 @@ class WFOCRApp:
             self.current_label.configure(text=f"显示截图失败: {e}")
     
     def display_results(self, results):
-        """显示识别结果"""
-        if not self.result_window or not self.result_text:
+        """显示识别结果（渲染为“按钮 + 价格文本”）"""
+        logger.info("开始显示识别结果")
+        logger.debug(f"原始结果: {results}")
+
+        if not self.result_window or not self.result_container:
+            logger.error("结果窗口不存在，无法显示结果")
             return
-        
-        # 清空之前的内容，只显示当前结果
-        self.result_text.delete('1.0', 'end')
-        
+
         # 过滤出有用的结果（跳过调试信息）
         useful_results = []
         for result in results:
             if result and not result.startswith('已保存带框图片'):
                 useful_results.append(result)
-        
-        # 显示结果
-        if useful_results:
-            for result in useful_results:
-                self.result_text.insert('end', f"{result}\n")
+
+        logger.info(f"过滤后的有用结果数量: {len(useful_results)}")
+        logger.debug(f"有用结果内容: {useful_results}")
+
+        # 清空区域
+        self._clear_result_container()
+
+        items = self._parse_items_from_results(useful_results)
+
+        if items:
+            logger.info("渲染识别结果为按钮")
+            for idx, (name, price_text) in enumerate(items):
+                row = ttk.Frame(self.result_container)
+                row.pack(fill='x', padx=10, pady=6)
+                # 是否使用按钮
+                lower_name = name.lower()
+                price_lower = str(price_text).lower()
+                is_forma = ('forma' in lower_name)
+                # 无匹配结果时不生成按钮，直接显示文本
+                is_unrecognized = ('未识别' in price_text) or ('未收录' in price_text) or ('无匹配结果' in price_text)
+                if not is_forma and not is_unrecognized:
+                    btn = ttk.Button(
+                        row,
+                        text=name,
+                        command=lambda n=name: self.on_item_button_click(n),
+                        style=self.result_button_style_name
+                    )
+                    btn.pack(side='left')
+                    lbl = ttk.Label(row, text=price_text, font=self.result_font)
+                    lbl.pack(side='left', padx=12)
+                else:
+                    # 直接文本，不使用按钮
+                    line = f"{name}：{price_text}"
+                    ttk.Label(row, text=line, font=self.result_font).pack(side='left')
+                logger.debug(f"行 {idx+1}: {name} -> {price_text}")
         else:
-            self.result_text.insert('end', "未识别到物品")
-        
-        # 保持固定窗口大小，不自动调整
-        
-        # 复制到剪切板
+            # 当无法结构化出 items 时也要给出反馈
+            if useful_results:
+                logger.info("无法结构化解析，回退显示原始识别输出")
+                for line in useful_results:
+                    ttk.Label(self.result_container, text=str(line), font=self.result_font).pack(padx=12, pady=2, anchor='w')
+            else:
+                # 完全无结果时，仍显示“xxxxxx：无匹配结果”。此处不知道具体xxxxxx内容，统一提示。
+                logger.info("未识别到物品，显示无匹配结果提示")
+                ttk.Label(self.result_container, text="识别内容：无匹配结果", font=self.result_font).pack(padx=12, pady=10, anchor='w')
+
+        # 复制到剪贴板（保持与原逻辑一致）
         if self.clipboard_var.get():
             try:
                 clipboard_text = "\n".join(useful_results)
                 pyperclip.copy(clipboard_text)
-            except:
-                pass  # 静默失败
+                logger.info("结果已复制到剪切板")
+            except Exception as e:
+                logger.warning(f"复制到剪切板失败: {e}")
+                pass
+
+    def _parse_items_from_results(self, useful_results):
+        """从结果文本中提取 (物品名, 价格文本) 列表"""
+        items = []
+        for line in useful_results:
+            text = str(line).strip()
+            # 跳过分组标题行，例如：模糊搜索 'xxx'结果：/ 少一字匹配 'xxx'结果：
+            if '结果：' in text:
+                continue
+            if '：' not in text:
+                continue
+            left, right = text.split('：', 1)
+            name = left.strip()
+            price_text = right.strip()
+            # 过滤非物品名称的行
+            if not name or ('模糊搜索' in name) or ('少一字匹配' in name):
+                continue
+            items.append((name, price_text))
+        return items
+
+    def _clear_result_container(self):
+        """清空结果容器"""
+        if self.result_container is None:
+            return
+        for child in self.result_container.winfo_children():
+            child.destroy()
+
+    def show_minimize_countdown(self, seconds=14):
+        """在状态栏显示倒计时提示，并在到时最小化结果窗口"""
+        # 取消已有倒计时
+        self.cancel_minimize_countdown()
+        if not self.result_window:
+            return
+        
+        # 记录总倒计时时间
+        self.countdown_remaining = seconds
+        
+        # 初始化提示
+        if self.result_status_label:
+            self.status_var.set(f"识别窗口将在 {seconds} 秒后最小化")
+
+        # 每秒更新倒计时
+        def tick():
+            if not self.result_window:
+                return
+            self.countdown_remaining -= 1
+            if self.countdown_remaining <= 0:
+                try:
+                    # 使用 withdraw 隐藏窗口，避免从最小化恢复时任务栏闪烁
+                    self.result_window.withdraw()
+                except Exception:
+                    try:
+                        self.result_window.iconify()
+                    except Exception:
+                        pass
+                return
+            # 只有当没有临时状态显示时才更新倒计时显示
+            if self.status_delay_timer is None and self.result_status_label:
+                self.status_var.set(f"识别窗口将在 {self.countdown_remaining} 秒后最小化")
+            self.result_minimize_after_id = self.result_window.after(1000, tick)
+
+        self.result_minimize_after_id = self.result_window.after(1000, tick)
+
+    def cancel_minimize_countdown(self):
+        """取消结果窗口最小化倒计时"""
+        try:
+            if self.result_window and self.result_minimize_after_id:
+                self.result_window.after_cancel(self.result_minimize_after_id)
+        except Exception:
+            pass
+        finally:
+            self.result_minimize_after_id = None
+    
+    def cancel_status_delay(self):
+        """取消状态延迟定时器"""
+        try:
+            if self.result_window and self.status_delay_timer:
+                self.result_window.after_cancel(self.status_delay_timer)
+        except Exception:
+            pass
+        finally:
+            self.status_delay_timer = None
+    
+    def show_temp_status(self, message, duration=3):
+        """显示临时状态信息，指定时间后恢复倒计时显示"""
+        # 取消之前的临时状态
+        self.cancel_status_delay()
+        
+        # 显示临时消息
+        if self.result_status_label:
+            self.status_var.set(message)
+        
+        # 设置定时器恢复倒计时显示
+        def restore_countdown():
+            self.status_delay_timer = None
+            if self.result_status_label and self.countdown_remaining > 0:
+                self.status_var.set(f"识别窗口将在 {self.countdown_remaining} 秒后最小化")
+        
+        self.status_delay_timer = self.result_window.after(duration * 1000, restore_countdown)
+    
+    def _safe_lift(self):
+        """安全地提升窗口，避免任务栏图标闪烁"""
+        try:
+            if self.result_window:
+                # 使用wm_attributes而不是lift()来避免焦点切换
+                self.result_window.wm_attributes('-topmost', False)
+                self.result_window.wm_attributes('-topmost', True)
+        except Exception:
+            pass
+
+    def on_item_button_click(self, item_name):
+        """点击物品按钮后保存CSV中的原始中文名到JSON文件，记录名称和点击次数（每次F8识别后只保存第一次点击）"""
+        try:
+            # 检查是否允许保存（每次F8后只能保存第一次点击）
+            if not self.can_save_click:
+                self.show_temp_status(f"本次识别已有保存记录，点击未统计: {item_name}")
+                return
+            
+            normalized = self._normalize_cn_text(item_name)
+            original_name = self.cn_name_map.get(normalized, item_name)
+            
+            # 读取现有的JSON数据
+            json_file = 'clicked_items.json'
+            if os.path.exists(json_file):
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    data = {}
+            else:
+                data = {}
+            
+            # 更新点击次数
+            if original_name in data:
+                data[original_name] += 1
+            else:
+                data[original_name] = 1
+            
+            # 保存回JSON文件
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            count = data[original_name]
+            logger.info(f"已保存点击物品: {original_name} (点击次数: {count})")
+            
+            # 显示保存成功信息（不显示点击次数）
+            self.show_temp_status(f"已保存点击物品: {original_name}")
+            
+            # 禁止本次识别的后续点击保存
+            self.can_save_click = False
+            
+        except Exception as e:
+            logger.error(f"保存点击物品失败: {e}")
+            if self.result_status_label:
+                self.status_var.set(f"保存失败: {e}")
     
 
     def on_clipboard_change(self):
@@ -419,21 +822,179 @@ class WFOCRApp:
             self.save_config()
             
             # 更新结果窗口字体
-            if self.result_window and self.result_text:
-                self.result_text.configure(font=('Consolas', font_size))
+            self.result_font = ('Consolas', font_size)
+            # 同步更新按钮样式字号
+            self.update_result_button_style()
+            if self.result_window and self.result_container:
+                for row in self.result_container.winfo_children():
+                    for w in row.winfo_children():
+                        try:
+                            w.configure(font=self.result_font)
+                        except Exception:
+                            pass
         except:
             pass
+
+    def update_result_button_style(self):
+        """根据当前字号更新ttk按钮样式，使按钮字号与价格字号一致，并放大按钮尺寸"""
+        try:
+            style = ttk.Style()
+            # 主题兼容处理
+            current_theme = style.theme_use()
+            # 设置字体
+            style.configure(self.result_button_style_name, font=self.result_font, padding=(10, 6))
+        except Exception as e:
+            logger.warning(f"更新按钮样式失败: {e}")
+    
+    def on_server_change(self):
+        """服务器选择改变"""
+        self.config['server_type'] = self.server_var.get()
+        self.save_config()
+    
+    def on_color_mode_change(self):
+        """颜色模式选择改变"""
+        self.config['color_mode'] = self.color_mode_var.get()
+        self.save_config()
+    
+    def update_price_status(self, message):
+        """更新价格数据状态显示"""
+        if hasattr(self, 'price_status_label'):
+            current_time = time.strftime("%H:%M:%S")
+            self.price_status_label.configure(text=f"{message} ({current_time})")
     
     def stop_script(self):
         """停止脚本"""
+        logger.info("=== 停止脚本 ===")
         self.script_running = False
         keyboard.unhook_all()  # 移除所有热键监听
+        logger.info("移除热键监听")
+        
+        # 停止价格更新定时器
+        if self.price_update_timer:
+            self.price_update_timer.cancel()
+            self.price_update_timer = None
+            logger.info("停止价格更新定时器")
         
         if self.result_window:
             self.result_window.destroy()
             self.result_window = None
+            logger.info("关闭结果窗口")
         
         self.start_button.configure(text="启动脚本", state='normal')
+        logger.info("脚本已停止")
+    
+    def download_price_json(self):
+        """下载price.json文件"""
+        logger.info("开始下载price.json文件")
+        try:
+            url = "url"
+            logger.info(f"请求价格数据: url")
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                logger.info("价格数据请求成功")
+                # 使用文件锁确保线程安全
+                with self.price_file_lock:
+                    return self._download_price_json_internal(response)
+            else:
+                logger.error(f"下载price.json失败，状态码: {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"下载price.json出错: {e}")
+            return False
+    
+    def _download_price_json_internal(self, response):
+        """内部下载函数，不使用文件锁（调用者需要确保已加锁）"""
+        try:
+            # 先下载到临时文件
+            temp_file = 'price.json.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(response.json(), f, ensure_ascii=False, indent=2)
+            
+            # 原子性替换：重命名临时文件为目标文件
+            if os.path.exists('price.json'):
+                os.remove('price.json')  # Windows需要先删除目标文件
+            os.rename(temp_file, 'price.json')
+            
+            logger.info("price.json文件下载成功")
+            # 更新状态显示
+            self.update_price_status("📊 价格数据已更新")
+            return True
+        except Exception as e:
+            logger.error(f"保存price.json文件出错: {e}")
+            # 清理可能存在的临时文件
+            try:
+                if os.path.exists('price.json.tmp'):
+                    os.remove('price.json.tmp')
+            except:
+                pass
+            return False
+    
+    def check_and_update_price_json(self):
+        """检查并更新price.json文件"""
+        try:
+            # 使用文件锁确保检查过程的原子性
+            with self.price_file_lock:
+                # 检查文件是否存在
+                if not os.path.exists('price.json'):
+                    print("price.json文件不存在，正在下载...")
+                    if not self._download_with_lock():
+                        messagebox.showerror("警告", "访问过于频繁，请在5分钟后下载 price.json 文件")
+                        return False
+                else:
+                    # 检查文件是否完整（能否正常解析JSON）
+                    try:
+                        with open('price.json', 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        if 'data' not in data:
+                            print("price.json文件格式错误，重新下载...")
+                            if not self._download_with_lock():
+                                messagebox.showerror("警告", "访问过于频繁，请在5分钟后下载 price.json 文件")
+                                return False
+                    except (json.JSONDecodeError, IOError) as e:
+                        print(f"price.json文件损坏，重新下载... 错误: {e}")
+                        if not self._download_with_lock():
+                            messagebox.showerror("警告", "访问过于频繁，请在5分钟后下载 price.json 文件")
+                            return False
+                    
+                    # 检查文件是否过期（超过7分钟）
+                    file_time = os.path.getmtime('price.json')
+                    current_time = time.time()
+                    if current_time - file_time > 420:  # 7分钟 = 420秒
+                        print("price.json文件已过期，正在更新...")
+                        self._download_with_lock()  # 这里不强制要求成功，允许使用旧数据
+            
+            return True
+        except Exception as e:
+            print(f"检查price.json文件时出错: {e}")
+            messagebox.showerror("错误", f"检查价格文件时出错: {e}")
+            return False
+    
+    def _download_with_lock(self):
+        """在已有锁的情况下下载文件"""
+        try:
+            url = "url"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                return self._download_price_json_internal(response)
+            else:
+                logger.error(f"下载price.json失败，状态码: {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"下载price.json出错: {e}")
+            return False
+    
+    def start_price_update_timer(self):
+        """启动价格更新定时器，每7分钟更新一次"""
+        def update_price():
+            if self.script_running and self.config['server_type'] == 'guangzhou':
+                self.download_price_json()
+                # 继续设置下一次更新
+                self.price_update_timer = threading.Timer(420, update_price)  # 7分钟
+                self.price_update_timer.start()
+        
+        # 7分钟后开始第一次更新
+        self.price_update_timer = threading.Timer(420, update_price)
+        self.price_update_timer.start()
     
     def preload_ocr(self):
         """预热OCR，在后台初始化以减少首次使用延迟"""
@@ -442,22 +1003,59 @@ class WFOCRApp:
                 # 触发OCR初始化
                 from ocr import get_ocr_reader
                 get_ocr_reader()
-                print("OCR预热完成")
+                logger.info("OCR预热完成")
             except Exception as e:
-                print(f"OCR预热失败: {e}")
+                logger.error(f"OCR预热失败: {e}")
+                # 如果是模型文件问题，给用户更友好的提示
+                if "打包环境中未找到EasyOCR模型文件" in str(e):
+                    logger.error("建议解决方案：重新下载完整版程序或检查程序文件完整性")
         
         # 在后台线程中初始化
         threading.Thread(target=init_ocr, daemon=True).start()
+
+    def load_cn_name_map(self):
+        """加载CSV中原始中文名映射：去空格小写 -> 原始Chinese"""
+        mapping = {}
+        try:
+            csv_path = get_resource_path('wfm_item_names_en_zh.csv')
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames or 'Chinese' not in reader.fieldnames:
+                    logger.warning("CSV缺少Chinese列，无法建立映射")
+                    return mapping
+                for row in reader:
+                    cn = (row.get('Chinese') or '').strip()
+                    if not cn:
+                        continue
+                    key = self._normalize_cn_text(cn)
+                    mapping[key] = cn
+            logger.info(f"加载CSV原始中文名映射完成，共{len(mapping)}条")
+        except Exception as e:
+            logger.error(f"加载CSV原始中文名映射失败: {e}")
+        return mapping
+
+    @staticmethod
+    def _normalize_cn_text(text):
+        """规范化：去空格/全角空格，转小写，去除中点分隔符"""
+        if text is None:
+            return ''
+        t = str(text)
+        t = t.replace(' ', '').replace('\u3000', '')
+        t = t.replace('·', '').replace('・', '')
+        return t.lower()
     
     def on_closing(self):
         """程序关闭"""
+        logger.info("=== 程序关闭 ===")
         self.stop_script()
         self.root.destroy()
+        logger.info("程序已完全关闭")
     
     def run(self):
         """运行程序"""
         self.root.mainloop()
 
 if __name__ == "__main__":
+    logger.info("=== 程序主入口启动 ===")
     app = WFOCRApp()
     app.run()

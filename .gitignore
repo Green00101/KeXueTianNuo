@@ -1,0 +1,42 @@
+# Python 运行时 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试
+test/
+
+# 调试
+debug/
+
+# 日志与临时
+*.log
+*.tmp
+*.temp
+.cache/
+
+# 构建与分发
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 环境与本地配置（如有敏感信息）
+.env
+.env.local
+*.local

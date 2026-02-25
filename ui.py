@@ -36,6 +36,8 @@ class WFOCRApp:
         
         # 状态变量
         self.script_running = False
+        self.recognition_in_progress = False  # 识别进行中时 F8 不生效
+        self.cancel_requested = False
         self.result_window = None
         self.crop_coords = None
         self.current_screenshot = None
@@ -49,6 +51,9 @@ class WFOCRApp:
         self.setup_ui()
         self.load_ideal_image()
         
+        # 启动时显示警告（与 README_Game 一致），可勾选下次不再提示
+        self.show_warning_if_needed()
+        
         # 预热OCR，在后台初始化以减少首次使用延迟
         self.preload_ocr()
         
@@ -59,7 +64,9 @@ class WFOCRApp:
             'resolution_height': '',
             'crop_coords': None,
             'copy_to_clipboard': False,
-            'font_size': 12
+            'font_size': 12,
+            'ocr_engine': 'easy',  # 'easy' | 'rapid' | 'paddle'（PaddleOCR 中文精度通常更好）
+            'skip_warning': False
         }
         
         if os.path.exists(self.config_file):
@@ -82,6 +89,46 @@ class WFOCRApp:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             messagebox.showerror("错误", f"保存配置失败: {e}")
+    
+    def show_warning_if_needed(self):
+        """启动时显示警告弹窗（与 README_Game 重要警告一致），可勾选下次不再提示"""
+        if self.config.get('skip_warning'):
+            return
+        dialog = Toplevel(self.root)
+        dialog.title("使用前请阅读")
+        dialog.geometry("520x320")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        warning_text = """⚠️ 使用前请仔细阅读 ⚠️
+
+1. 官方态度：请先阅读 Warframe 官方对第三方工具的态度和相关政策：
+   第三方软件与您
+   https://support.warframe.com/hc/zh-cn/articles/360030014351
+
+2. 技术原理：本软件不读取游戏内存，仅通过截图并识别屏幕上的文字，然后通过公开 API 查询价格。
+
+3. 风险提示：使用任何第三方工具都存在一定风险，包括但不限于账号处罚。请自行评估风险并承担使用后果。
+
+4. 合规使用：请确保你的使用方式符合游戏的用户协议和相关法律法规。"""
+        
+        txt = tk.Text(dialog, wrap='word', font=('Microsoft YaHei UI', 10), padx=12, pady=12, height=14)
+        txt.pack(fill='both', expand=True)
+        txt.insert('1.0', warning_text)
+        txt.configure(state='disabled')
+        
+        skip_var = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(dialog, text="下次不再提示", variable=skip_var)
+        cb.pack(pady=(0, 8))
+        
+        def on_confirm():
+            if skip_var.get():
+                self.config['skip_warning'] = True
+                self.save_config()
+            dialog.grab_release()
+            dialog.destroy()
+        
+        ttk.Button(dialog, text="确认", command=on_confirm).pack(pady=(0, 12))
     
     def setup_ui(self):
         """设置界面"""
@@ -119,6 +166,14 @@ class WFOCRApp:
         ttk.Checkbutton(control_frame, text="将结果复制到剪切板", 
                        variable=self.clipboard_var,
                        command=self.on_clipboard_change).pack(side='left', padx=10)
+        
+        # OCR 引擎选择（easy / rapid / paddle）
+        ttk.Label(control_frame, text="OCR 引擎:").pack(side='left', padx=(20, 5))
+        self.ocr_engine_var = tk.StringVar(value=self.config.get('ocr_engine', 'easy'))
+        ocr_engine_combo = ttk.Combobox(control_frame, textvariable=self.ocr_engine_var,
+                                        values=['easy', 'rapid', 'paddle'], width=8, state='readonly')
+        ocr_engine_combo.pack(side='left', padx=5)
+        ocr_engine_combo.bind('<<ComboboxSelected>>', self.on_ocr_engine_change)
         
         # 字号选择
         ttk.Label(control_frame, text="字号:").pack(side='left', padx=(20, 5))
@@ -296,73 +351,141 @@ class WFOCRApp:
         threading.Thread(target=self.start_hotkey_listener, daemon=True).start()
     
     def create_result_window(self):
-        """创建结果显示窗口"""
+        """创建结果显示窗口（小窗口 + 状态提示 + 表格）"""
         self.result_window = Toplevel(self.root)
         self.result_window.title("识别结果")
-        self.result_window.geometry("1050x200")
-        self.result_window.configure(bg='black')
+        self.result_window.geometry("640x380")
         
-        # 创建文本框
-        self.result_text = tk.Text(self.result_window, 
-                                  bg='black', 
-                                  fg='white', 
-                                  font=('Consolas', self.config['font_size']),
-                                  wrap='word',
-                                  padx=10,
-                                  pady=10)
+        top_frame = ttk.Frame(self.result_window)
+        top_frame.pack(fill='x', padx=8, pady=6)
+        self.result_status_label = ttk.Label(top_frame, text="脚本已开启，按 F8 开始识别", font=('Microsoft YaHei UI', 10))
+        self.result_status_label.pack(anchor='w')
+        self.result_cancel_btn = ttk.Button(top_frame, text="取消", command=self.cancel_recognition, state='disabled')
+        self.result_cancel_btn.pack(side='right')
         
-        self.result_text.pack(fill='both', expand=True)
+        # 表格区域
+        table_frame = ttk.Frame(self.result_window)
+        table_frame.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         
-        # 初始提示
-        self.result_text.insert('end', "脚本已开启，按F8开始识别")
+        columns = ('item', 'price')
+        self.result_tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=12)
+        self.result_tree.heading('item', text='物品 / 说明')
+        self.result_tree.heading('price', text='价格 / 结果')
+        self.result_tree.column('item', width=280)
+        self.result_tree.column('price', width=320)
+        scrollbar = ttk.Scrollbar(table_frame)
         
-        # 关闭事件
+        self.result_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        self.result_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=self.result_tree.yview)
+        
+        self.result_text = None  # 不再使用文本框，保留引用避免报错
+        
         self.result_window.protocol("WM_DELETE_WINDOW", self.stop_script)
     
     def start_hotkey_listener(self):
         """开始监听热键"""
         keyboard.add_hotkey('f8', self.on_f8_pressed)
     
+    def _set_loading_phase(self, phase):
+        """在结果窗口显示加载阶段：'ocr' 或 'searching'"""
+        if not self.result_window or not getattr(self, 'result_status_label', None):
+            return
+        if phase == 'ocr':
+            self.result_status_label.configure(text="正在识别图片…")
+        elif phase == 'searching':
+            self.result_status_label.configure(text="正在搜索价格…")
+    
+    def _run_ocr_with_callback(self, img_array):
+        """在后台线程中执行 OCR+查价，通过 callback 通知主线程切换阶段。返回 (results, error)。"""
+        err = None
+        results = []
+        def on_searching():
+            self.root.after(0, self._set_loading_phase, 'searching')
+        try:
+            results = self._run_ocr(img_array, progress_callback=on_searching)
+        except Exception as e:
+            err = str(e)
+        return results, err
+    
     def on_f8_pressed(self):
         """F8按键响应"""
         if not self.script_running:
             return
+        if self.recognition_in_progress:
+            return  # 识别过程中 F8 不生效
         
-        # 检查时间间隔
         import time
         current_time = time.time()
-        if current_time - self.last_screenshot_time < 1.0:  # 1秒间隔
+        if current_time - self.last_screenshot_time < 1.0:
             return
         self.last_screenshot_time = current_time
         
-        try:
-            # 截图
-            width = int(self.config['resolution_width'])
-            height = int(self.config['resolution_height'])
-            screenshot = pyautogui.screenshot(region=(0, 0, width, height))
-            
-            # 裁剪
-            coords = self.config['crop_coords']
-            cropped = screenshot.crop(coords)
-            
-            # 显示当前截图
-            self.update_current_screenshot(cropped)
-            
-            # 转换为numpy数组
-            img_array = np.array(cropped)
-            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-            
-            # OCR识别
-            results = ocr_and_search_prices(img_array)
-            
-            # 显示结果
+        def do_work():
+            try:
+                self.root.after(0, self._start_recognition_ui)
+                width = int(self.config['resolution_width'])
+                height = int(self.config['resolution_height'])
+                screenshot = pyautogui.screenshot(region=(0, 0, width, height))
+                coords = self.config['crop_coords']
+                cropped = screenshot.crop(coords)
+                img_array = np.array(cropped)
+                img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                self.root.after(0, lambda: self.update_current_screenshot(cropped))
+                self.root.after(0, self._set_loading_phase, 'ocr')
+                results, err = self._run_ocr_with_callback(img_array)
+                self.root.after(0, lambda: self._on_recognition_done(results, err))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_recognition_done([], str(e)))
+        
+        threading.Thread(target=do_work, daemon=True).start()
+    
+    def _start_recognition_ui(self):
+        """开始识别时：标记进行中并显示取消按钮"""
+        self.recognition_in_progress = True
+        self.cancel_requested = False
+        if getattr(self, 'result_cancel_btn', None):
+            self.result_cancel_btn.configure(state='normal')
+    
+    def cancel_recognition(self):
+        """用户点击取消：恢复初始状态，可重新按 F8 识别"""
+        self.cancel_requested = True
+        self._restore_result_window_initial()
+    
+    def _restore_result_window_initial(self):
+        """恢复结果窗口为初始状态（取消或完成后统一调用）"""
+        self.recognition_in_progress = False
+        if getattr(self, 'result_cancel_btn', None):
+            self.result_cancel_btn.configure(state='disabled')
+        if getattr(self, 'result_status_label', None):
+            self.result_status_label.configure(text="脚本已开启，按 F8 开始识别")
+        if getattr(self, 'result_tree', None):
+            for i in self.result_tree.get_children():
+                self.result_tree.delete(i)
+    
+    def _on_recognition_done(self, results, err):
+        """后台识别完成后的回调：若已取消则仅恢复状态，否则显示结果或错误"""
+        if self.cancel_requested:
+            self._restore_result_window_initial()
+            self.cancel_requested = False
+            return
+        if err:
+            self._show_result_error(err)
+        else:
             self.display_results(results)
-            
-        except Exception as e:
-            error_msg = f"识别出错: {e}"
-            if self.result_window and self.result_text:
-                self.result_text.delete('1.0', 'end')
-                self.result_text.insert('end', error_msg)
+        self.recognition_in_progress = False
+        if getattr(self, 'result_cancel_btn', None):
+            self.result_cancel_btn.configure(state='disabled')
+    
+    def _show_result_error(self, message):
+        """在结果窗口显示错误信息"""
+        if not self.result_window or not getattr(self, 'result_status_label', None):
+            return
+        self.result_status_label.configure(text=f"识别出错: {message}")
+        for i in self.result_tree.get_children():
+            self.result_tree.delete(i)
+        self.result_tree.insert('', 'end', values=(message, ''))
     
     def update_current_screenshot(self, image):
         """更新当前截图显示"""
@@ -375,36 +498,59 @@ class WFOCRApp:
             self.current_label.configure(text=f"显示截图失败: {e}")
     
     def display_results(self, results):
-        """显示识别结果"""
-        if not self.result_window or not self.result_text:
+        """在结果窗口的表格中显示识别结果"""
+        if not self.result_window or not getattr(self, 'result_tree', None):
             return
         
-        # 清空之前的内容，只显示当前结果
-        self.result_text.delete('1.0', 'end')
+        self.result_status_label.configure(text="识别完成，可继续按 F8 识别")
         
-        # 过滤出有用的结果（跳过调试信息）
-        useful_results = []
-        for result in results:
-            if result and not result.startswith('已保存带框图片'):
-                useful_results.append(result)
+        for i in self.result_tree.get_children():
+            self.result_tree.delete(i)
         
-        # 显示结果
+        useful_results = [r for r in results if r and not r.startswith('已保存带框图片')]
+        
         if useful_results:
-            for result in useful_results:
-                self.result_text.insert('end', f"{result}\n")
+            for line in useful_results:
+                if '：' in line:
+                    idx = line.index('：')
+                    col1, col2 = line[:idx].strip(), line[idx + 1:].strip()
+                else:
+                    col1, col2 = line.strip(), ''
+                self.result_tree.insert('', 'end', values=(col1, col2))
         else:
-            self.result_text.insert('end', "未识别到物品")
+            self.result_tree.insert('', 'end', values=('未识别到物品', ''))
         
-        # 保持固定窗口大小，不自动调整
-        
-        # 复制到剪切板
         if self.clipboard_var.get():
             try:
-                clipboard_text = "\n".join(useful_results)
-                pyperclip.copy(clipboard_text)
-            except:
-                pass  # 静默失败
-    
+                pyperclip.copy("\n".join(useful_results))
+            except Exception:
+                pass
+
+    def _run_ocr(self, img_array, progress_callback=None):
+        """根据配置调用 EasyOCR / RapidOCR / PaddleOCR，返回查价结果列表。支持 progress_callback('searching')。"""
+        engine = self.config.get('ocr_engine', 'easy')
+        if engine == 'rapid':
+            try:
+                from ocr_rapid import ocr_and_search_prices_rapid
+                return ocr_and_search_prices_rapid(img_array, progress_callback=progress_callback)
+            except ImportError:
+                return ["未安装 RapidOCR，请执行: pip install rapidocr_onnxruntime"]
+            except Exception as e:
+                return [f"RapidOCR 识别出错: {e}"]
+        if engine == 'paddle':
+            try:
+                from ocr_paddle import ocr_and_search_prices_paddle
+                return ocr_and_search_prices_paddle(img_array, progress_callback=progress_callback)
+            except ImportError:
+                return ["未安装 PaddleOCR，请执行: pip install paddlepaddle paddleocr"]
+            except Exception as e:
+                return [f"PaddleOCR 识别出错: {e}"]
+        return ocr_and_search_prices(img_array, progress_callback=progress_callback)
+
+    def on_ocr_engine_change(self, event=None):
+        """OCR 引擎改变"""
+        self.config['ocr_engine'] = self.ocr_engine_var.get()
+        self.save_config()
 
     def on_clipboard_change(self):
         """复制到剪切板选项改变"""
@@ -417,11 +563,7 @@ class WFOCRApp:
             font_size = int(self.font_size_var.get())
             self.config['font_size'] = font_size
             self.save_config()
-            
-            # 更新结果窗口字体
-            if self.result_window and self.result_text:
-                self.result_text.configure(font=('Consolas', font_size))
-        except:
+        except Exception:
             pass
     
     def stop_script(self):
@@ -438,15 +580,23 @@ class WFOCRApp:
     def preload_ocr(self):
         """预热OCR，在后台初始化以减少首次使用延迟"""
         def init_ocr():
+            engine = self.config.get('ocr_engine', 'easy')
             try:
-                # 触发OCR初始化
-                from ocr import get_ocr_reader
-                get_ocr_reader()
-                print("OCR预热完成")
+                if engine == 'rapid':
+                    from rapidocr_onnxruntime import RapidOCR
+                    RapidOCR()
+                    print("RapidOCR 预热完成")
+                elif engine == 'paddle':
+                    from ocr_paddle import _get_paddle_ocr
+                    _get_paddle_ocr()
+                    print("PaddleOCR 预热完成")
+                else:
+                    from ocr import get_ocr_reader
+                    get_ocr_reader()
+                    print("EasyOCR 预热完成")
             except Exception as e:
-                print(f"OCR预热失败: {e}")
-        
-        # 在后台线程中初始化
+                print(f"OCR 预热失败: {e}")
+
         threading.Thread(target=init_ocr, daemon=True).start()
     
     def on_closing(self):

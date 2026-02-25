@@ -1,0 +1,13 @@
+Pillow
+pyautogui
+opencv-python
+numpy
+keyboard
+pyperclip
+easyocr
+pandas
+requests
+
+# 可选：PaddleOCR（在界面 OCR 引擎中选择 paddle 时使用，中文识别精度通常更好）
+paddlepaddle
+paddleocr

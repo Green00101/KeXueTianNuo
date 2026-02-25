@@ -1,11 +1,10 @@
 import cv2
 import numpy as np
-import easyocr
-import pandas as pd
-import requests
 import sys
 import os
-from collections import Counter
+
+import easyocr
+
 
 def get_resource_path(relative_path):
     """获取资源文件的绝对路径，兼容开发环境和打包后的环境"""
@@ -29,38 +28,111 @@ def get_ocr_reader():
         _ocr_reader = easyocr.Reader(['ch_sim', 'en'])
     return _ocr_reader
 
-def ocr_and_search_prices(ori_img):
+
+from search_prices import search_prices_from_merged_items
+
+
+def ocr_and_search_prices(ori_img, progress_callback=None):
     """
     OCR识别图片中的物品并查询Warframe Market价格
     
     参数:
         ori_img: 输入图片路径或numpy数组
+        progress_callback: 可选，阶段切换时调用 progress_callback('searching')（OCR 完成后、查价前）
         
     返回:
         list: 包含所有识别和搜索结果的列表
     """
     results = []
-    
-    # ---- 步骤1：提取黄色文字，生成白底黄字图 ----
+    # ---- 步骤1：提取文字（金/白/浅色），生成高对比度图供 OCR ----
     if isinstance(ori_img, str):
         img = cv2.imread(ori_img)
     else:
         img = ori_img
-        
+    if img is None:
+        return ["无法读取图片"]
+
+    # 小图或扁条图放大，提升小字/多行识别率
+    h, w = img.shape[:2]
+    scale = 1.0
+    if h < 120 or max(w, h) < 500:
+        scale = 2.0
+    elif h < 180 or max(w, h) < 800:
+        scale = 1.5
+    if scale != 1.0:
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        h, w = img.shape[:2]
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 轻度双边滤波，压背景噪点、保留文字边缘
+    gray = cv2.bilateralFilter(gray, 5, 50, 50)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower_yellow = np.array([20, 100, 150])
-    upper_yellow = np.array([26, 255, 255])
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-    # 白底
-    white_bg = np.ones_like(img) * 255
-    result = cv2.bitwise_and(img, img, mask=mask)
-    inv_mask = cv2.bitwise_not(mask)
-    white_part = cv2.bitwise_and(white_bg, white_bg, mask=inv_mask)
-    final = cv2.add(result, white_part)
-    cv2.imwrite('yellow_on_white_ori.png', final)
+    # 金色（选中态）：黄-橙-金
+    lower_gold = np.array([5, 40, 90])
+    upper_gold = np.array([50, 255, 255])
+    gold_mask = cv2.inRange(hsv, lower_gold, upper_gold)
 
-    # ---- 步骤2：自动裁剪文字区域 ----
+    # 白色/高亮（未选中态）
+    lower_white = np.array([0, 0, 140])
+    upper_white = np.array([180, 85, 255])
+    white_mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # 浅色文字（未选中偏灰白/米色，real 等图）
+    lower_light = np.array([0, 0, 115])
+    upper_light = np.array([180, 95, 255])
+    light_mask = cv2.inRange(hsv, lower_light, upper_light)
+
+    mask = cv2.bitwise_or(gold_mask, white_mask)
+    mask = cv2.bitwise_or(mask, light_mask)
+    # 形态学：先开运算去小噪点，再闭运算连通笔画
+    kernel_open = np.ones((2, 2), np.uint8)
+    kernel_close = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+    # 去掉小连通域（噪点、图标碎片）；多行/复杂图适当提高以去图标
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = 40
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            cv2.drawContours(mask, [c], -1, 0, -1)
+    # 生成高对比度图：掩码区域内为“黑字”（原图亮→反相为暗），区域外白底，便于 OCR
+    inv_gray = 255 - gray
+    final = np.where(mask > 0, inv_gray, 255).astype(np.uint8)
+    # 可选：对整图做 CLAHE 提升对比度
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        final = clahe.apply(final)
+    except Exception:
+        pass
+    # 水平投影检测多行带区，分带 OCR 减轻行间重叠与干扰（单行也走分带逻辑，便于统一处理）
+    def _horizontal_bands(mask_img, min_gap=4, min_height=4, pad=6):
+        proj = np.sum(mask_img > 0, axis=1).astype(np.float32)
+        if proj.max() <= 0:
+            return None
+        kernel = np.ones(5, np.float32) / 5
+        proj = np.convolve(proj, kernel, mode='same')
+        thresh = max(1, 0.08 * proj.max())  # 略降阈值，多行时更容易拆出带
+        rows = np.where(proj >= thresh)[0]
+        if len(rows) < min_height:
+            return None
+        gaps = np.diff(rows)
+        gap_idx = np.where(gaps > min_gap)[0]
+        starts = [rows[0]]
+        ends = []
+        for i in gap_idx:
+            ends.append(rows[i] + 1)
+            starts.append(rows[i + 1])
+        ends.append(rows[-1] + 1)
+        bands = []
+        for s, e in zip(starts, ends):
+            if e - s >= min_height:
+                bands.append((max(0, s - pad), min(mask_img.shape[0], e + pad)))
+        return bands if len(bands) >= 1 else None
+
+    bands = _horizontal_bands(mask)
+    use_band_ocr = bands is not None
+    # ---- 步骤2：EasyOCR 识别（整图或分带） ----
     # img = cv2.imread('yellow_on_white_ori.png')
     # gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     # _, binary = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
@@ -78,171 +150,74 @@ def ocr_and_search_prices(ori_img):
     # else:
     #     left, right = 0, binary.shape[1]-1
 
-    # cropped = img[top:bottom+1, left:right+1]
-    # cv2.imwrite('cropped.png', cropped)
+    reader = get_ocr_reader()
+    ocr_kw = dict(
+        detail=1, batch_size=1, workers=1, paragraph=False,
+        text_threshold=0.35, low_text=0.25, contrast_ths=0.1,
+        adjust_contrast=0.3, min_size=6, decoder='greedy'
+    )
 
-    # ---- 步骤3：EasyOCR识别文字，进行包含合并 ----
-    reader = get_ocr_reader()  # 使用全局reader，避免重复初始化
-    
-    # 直接从处理后的图像进行OCR，避免文件读写
-    if isinstance(ori_img, str):
-        result = reader.readtext(ori_img, detail=1)
+    if use_band_ocr and bands is not None:
+        result = []
+        for i, (r0, r1) in enumerate(bands):
+            strip = final[r0:r1, :]
+            if strip.size == 0:
+                continue
+            part = reader.readtext(strip, **ocr_kw)
+            for bbox, text, conf in part:
+                # 将条带内坐标还原到整图
+                adj = [[p[0], p[1] + r0] for p in bbox]
+                result.append((adj, text, conf))
     else:
-        # 如果是numpy数组，直接使用
-        result = reader.readtext(final, detail=1)
-
-    # 3. 画bbox到图片上
-    # for bbox, text, conf in result:
-    #     # 将裁剪后的坐标转换为原始图片坐标
-    #     pts = [(int(float(x) + int(left)), int(float(y) + int(top))) for x, y in bbox]
-    #     # 画多边形框线，pts顺序通常是左上-右上-右下-左下
-    #     cv2.polylines(img, [np.array(pts)], isClosed=True, color=(0,255,0), thickness=2)
-
-    # # 4. 保存结果图片
-    # cv2.imwrite('ocr_boxed.png', img)
-    #results.append('已保存带框图片 ocr_boxed.png')
-    
-    # 转结构化list
+        result = reader.readtext(final, **ocr_kw)
+    # 转结构化 list，过滤明显无效结果（分隔符、极低置信度噪点）
     items = []
     for bbox, text, conf in result:
+        t = (text or '').strip()
+        if not t or t in ('|', '| ', ' |', '—', '-'):
+            continue
+        if conf < 0.2 and len(t) < 4:  # 短且置信度极低多为噪点
+            continue
+        if len(t) <= 1 and conf < 0.5:
+            continue
+        y_center = (int(bbox[0][1]) + int(bbox[2][1])) // 2
         x1 = int(bbox[0][0])
         x2 = int(bbox[2][0])
         if x1 > x2:
             x1, x2 = x2, x1
-        items.append({'x1': x1, 'x2': x2, 'text': text, 'merged': False})
+        items.append({'x1': x1, 'x2': x2, 'y_center': y_center, 'text': text, 'conf': conf, 'merged': False})
 
-    # 包含合并逻辑
-    # 记录被合并掉的元素的下标
-    merged_indices = []
-    for i, item_a in enumerate(items):
-        for j in range(i + 1, len(items)):
-            item_b = items[j]
-            if item_a['x1'] <= item_b['x1'] and item_a['x2'] >= item_b['x2']:
-                item_b['text'] = item_a['text'] + item_b['text']
-                merged_indices.append(i)  # 不去重，每次合并都记一次
-
-    # 按下标逆序删除，避免下标错位
-    for idx in sorted(set(merged_indices), reverse=True):
-        del items[idx]
-
-    # 输出最终结果
-    #results.append("最终合并结果：")
-    #for item in items:
-    #    if not item['merged']:
-    #        results.append(item['text'])
-
-    csv_path = get_resource_path('wfm_item_names_en_zh.csv')
-    df_map = pd.read_csv(csv_path)
-    df_map['Chinese_nospace'] = df_map['Chinese'].str.replace(' ', '')
-    cn2url = dict(zip(df_map['Chinese_nospace'], df_map['url_name']))
-
-    def find_en_by_cn(cn):
-        # 查找前先去空格，并转换为小写
-        cn_nospace = cn.replace(' ', '').lower()
-        # 创建小写版本的映射字典
-        cn2url_lower = {k.lower(): v for k, v in cn2url.items()}
-        return cn2url_lower.get(cn_nospace, None)
-
-    # ---- 查warframe market售价 ----
-    def get_wfm_prices(item_en_name):
-        url = f'https://api.warframe.market/v1/items/{item_en_name}/orders'
-        headers = {
-            'accept': 'application/json'
-        }
-        r = requests.get(url, headers=headers)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if "payload" not in data or "orders" not in data["payload"]:
-            return None
-        # 只统计卖家且为在售状态
-        orders = [o for o in data["payload"]["orders"] if o["order_type"]=="sell" and o["user"]["status"]=="ingame"]
-        # 前10名
-        orders = sorted(orders, key=lambda x: x['platinum'])[:10]
-        price_counter = Counter([o['platinum'] for o in orders])
-        return price_counter
-
-    exact_found = []
-    need_fuzzy = []
-    #results.append(f"OCR识别结果：{', '.join(item['text'] for item in items)}")
-    
+    # 按行分组，同行内再按 X 间距拆成多个物品（避免整行合并成一条）
+    # 自适应行距：图越高多行越多，用更严的行距避免不同行被合并
+    line_threshold = max(8, min(14, h // 55))
+    x_gap_threshold = 20  # 两段文字 X 间距大于此视为不同物品
+    lines = []
     for item in items:
-        zh = item['text']
-        
-        # 检查是否包含Forma关键字
-        if 'Forma' in zh or 'forma' in zh.lower():
-            results.append(f"{zh}：未收录")
-            continue
-        
-        # 如果以'蓝'结尾，先加上'图'再匹配
-        search_zh = zh
-        if zh.endswith('蓝'):
-            search_zh = zh + '图'
-        
-        en = find_en_by_cn(search_zh)
-        if en:
-            # ---- 精确匹配查价 ----
-            price_counter = get_wfm_prices(en)
-            if price_counter:
-                price_list = [f"{price}p×{count}人" for price, count in price_counter.items()]
-                # 如果使用了修正后的名称，显示修正信息
-                if search_zh != zh:
-                    results.append(f"{search_zh}：{', '.join(price_list)}")
-                else:
-                    results.append(f"{zh}：{', '.join(price_list)}")
-            else:
-                # 如果使用了修正后的名称，显示修正信息
-                if search_zh != zh:
-                    results.append(f"{search_zh}：无有效卖单")
-                else:
-                    results.append(f"{zh}：无有效卖单")
-        else:
-            # ---- 模糊搜索1字偏差（忽略空格，不区分大小写） ----
-            zh_text_nospace = search_zh.replace(' ', '').lower()
-            fuzzy_list = []
-            for zh_db, en_db in cn2url.items():
-                zh_db_lower = zh_db.lower()
-                if len(zh_db_lower) == len(zh_text_nospace):
-                    diff = sum(a != b for a, b in zip(zh_db_lower, zh_text_nospace))
-                    if diff == 1:
-                        fuzzy_list.append((zh_db, en_db))
-            if fuzzy_list:
-                display_name = search_zh if search_zh != zh else zh
-                results.append(f"模糊搜索  '{display_name}'结果：")
-                for zh_match, en_fuzzy in fuzzy_list:
-                    price_counter = get_wfm_prices(en_fuzzy)
-                    if price_counter:
-                        price_list = [f"{price}p×{count}人" for price, count in price_counter.items()]
-                        results.append(f"  {zh_match}：{', '.join(price_list)}")
-                    else:
-                        results.append(f"  {zh_match}：无有效卖单")
-            else:
-                # ---- 少一字匹配（词库里的词比识别出的词多一个字，且只能是最后一个字，不区分大小写） ----
-                less_one_list = []
-                for zh_db, en_db in cn2url.items():
-                    zh_db_lower = zh_db.lower()
-                    # 词库中的词长度比识别出的词长度多1
-                    if len(zh_db_lower) == len(zh_text_nospace) + 1:
-                        # 检查词库中的词去掉最后一个字符后是否与识别出的词完全匹配
-                        if zh_db_lower[:-1] == zh_text_nospace:
-                            less_one_list.append((zh_db, en_db))
-                
-                if less_one_list:
-                    display_name = search_zh if search_zh != zh else zh
-                    results.append(f"少一字匹配  '{display_name}'结果：")
-                    for zh_match, en_fuzzy in less_one_list:
-                        price_counter = get_wfm_prices(en_fuzzy)
-                        if price_counter:
-                            price_list = [f"{price}p×{count}人" for price, count in price_counter.items()]
-                            results.append(f"  {zh_match}：{', '.join(price_list)}")
-                        else:
-                            results.append(f"  {zh_match}：无有效卖单")
-                else:
-                    # 使用修正后的名称显示搜索结果
-                    display_name = search_zh if search_zh != zh else zh
-                    results.append(f"模糊搜索'{display_name}'无匹配结果")
-    
-    return results
+        added = False
+        for line in lines:
+            if abs(item['y_center'] - line['y_center']) <= line_threshold:
+                line['items'].append(item)
+                line['y_center'] = (line['y_center'] * len(line['items']) + item['y_center']) // (len(line['items']) + 1)
+                added = True
+                break
+        if not added:
+            lines.append({'y_center': item['y_center'], 'items': [item]})
+
+    merged_items = []
+    for line in lines:
+        sorted_items = sorted(line['items'], key=lambda x: x['x1'])
+        for item in sorted_items:
+            t = (item['text'] or '').strip()
+            if not t:
+                continue
+            merged_items.append({'x1': item['x1'], 'x2': item['x2'], 'text': t, 'merged': True})
+
+    if progress_callback:
+        try:
+            progress_callback('searching')
+        except Exception:
+            pass
+    return search_prices_from_merged_items(merged_items)
 
 
 # 为了保持向后兼容，如果直接运行此文件，使用默认参数
